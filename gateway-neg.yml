@@ -1,0 +1,20 @@
+# NEG pointing to gateway-collector
+# internal-lb7-app will point to this NEG
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neg-otel-gateway-collector
+  namespace: kube-monitoring
+  annotations:
+    cloud.google.com/neg: '{"exposed_ports": {"4318":{}}}'
+    controller.autoneg.dev/neg: '{"backend_services":{"4318":[{"name":"otel-gateway-collector-k8s","region":"europe-west1","max_rate_per_endpoint":1000000}]}}'
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      protocol: TCP
+      port: 4318
+      targetPort: otlp-http
+  selector:
+    app.kubernetes.io/instance: kube-monitoring.gateway-otel-collector

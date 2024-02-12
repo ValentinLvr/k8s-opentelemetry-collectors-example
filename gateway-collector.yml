@@ -1,0 +1,145 @@
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: gateway-otel-collector
+  namespace: kube-monitoring
+  labels:
+    app.kubernetes.io/instance: gateway-otel-collector
+    app_kind: "observability"
+    app: "gateway-otel-collector"
+    criticality: "c2"
+    customer_facing: "false"
+    exposition: "private"
+spec:
+  mode: deployment
+  serviceAccount: otelcontribcol
+  # Node affinity is conceptually similar to nodeSelector
+  # it allows you to constrain which nodes your pod is eligible to be scheduled on, based on labels on the node.
+  # Node Taint + Pod Toleration + Pod Node Affinity is the final combo to ensure that specific Pods Node will run on the same page.   
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: 'node.keplr.io/workload'
+            operator: In
+            values:
+              - stable
+  resources:
+    requests:
+      memory: 100Mi
+    limits:
+      memory: 1Gi
+  env:
+    - name: DD_SERVICE
+      value: gateway-otel-collector
+    - name: DD_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: dd-secrets
+          key: api-key
+    - name: ELASTIC_APM_SERVER_ENDPOINT
+      valueFrom:
+        secretKeyRef:
+          name: elastic-apm
+          key: server_endpoint
+    - name: ELASTIC_APM_SECRET_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: elastic-apm
+          key: secret
+    - name: HONEYCOMB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: honeycomb
+          key: api-key
+    - name: K8S_NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+  config: |
+    # -------------------------------------------------
+    # -------- FICHIER DE CONFIG DU COLLECTOR ---------
+    # -------------------------------------------------
+
+    # Read more about receivers here:
+    # https://opentelemetry.io/docs/collector/configuration/#receivers
+    receivers:
+      # The OTLP receiver is the most common receiver. It is the default way to send data from
+      # OpenTelemetry instrumentation libraries. Documentation on this receiver is available here:
+      # https://github.com/open-telemetry/opentelemetry-collector/tree/main/receiver/otlpreceiver#readme
+      otlp:
+        # Protocols defines the protocols enabled for this receiver. At least one protocol of choice must
+        # be enabled.
+        protocols:
+          # The presence of the http section enables the HTTP server on the default port (4318)
+          http:
+          # The presence of the gRPC section enables the gRPC server on the default port (4317)
+          grpc:
+
+    # Read more about processors here: https://opentelemetry.io/docs/collector/configuration/#processors
+    #
+    # Some processors are recommended in all pipelines:
+    # https://github.com/open-telemetry/opentelemetry-collector/tree/main/processor#recommended-processors
+    processors:
+      # The batch processor batches telemetry data into larger payloads.
+      # It is necessary for the Datadog traces exporter to work optimally,
+      # and is recommended for any production pipeline.
+      batch:
+        timeout: 10s
+      batch/datadog:
+        send_batch_max_size: 1000
+        send_batch_size: 100
+        timeout: 10s
+      
+      probabilistic_sampler:
+        hash_seed: 22
+        sampling_percentage: $HC_SAMPLE_RATE
+
+      filter:
+        traces:
+          span:
+            - 'IsMatch(name, ".*grpc.google.pubsub.v1.*") == true' # filter grpc Pubsub spans
+            - 'IsMatch(attributes["http.host"], ".*apm.europe-west1.gcp.cloud.es.io.*") == true' # filter spans that has the Elastic APM host in it
+            - 'IsMatch(name, ".*query SET ROLE TO catman_api; SET catman.account_id.*") == true' # filter noisy catman SET ROLE spans
+            - 'IsMatch(name, ".*query SET catman.account_id = default; SET catman.user_id = default.*") == true'
+            - 'IsMatch(attributes["http.target"], "/_next/.*") == true and IsMatch(attributes["http.target"], "/_next/data/.*") == false' # filter ecom front useless spans
+            - 'IsMatch(attributes["http.target"], "/favicon/.*") == true'
+            - 'IsMatch(attributes["http.target"], "/.well-known/.*") == true'
+
+
+    # Read more about exporters here:
+    # https://opentelemetry.io/docs/collector/configuration/#exporters
+    exporters:
+      # logging:
+      #   loglevel: debug
+      # The OTLP exporter is necessary **only** on gateway deployment mode, to relay telemetry data to the gateway.
+      ## otlp:
+        ## @param endpoint - string - required
+        ## Endpoint where to send telemetry. On gateway mode, we set it to the gateway host IP.
+        #
+        # endpoint: ${GATEWAY_HOST_IP}:4317
+      
+      otlp/honeycombTraces:
+        endpoint: "api.honeycomb.io:443"
+        headers:
+          "x-honeycomb-team": "${env:HONEYCOMB_API_KEY}"
+
+    # `service` defines the Collector pipelines, observability settings and extensions.
+    service:
+      # `pipelines` defines the data pipelines. Multiple data pipelines for a type may be defined.
+      pipelines:        
+        traces/gateway-elastic:
+          receivers: [otlp]
+          processors: [filter, batch]
+          exporters: [otlphttp/elastic]
+
+        traces/gateway-datadog:
+          receivers: [otlp]
+          processors: [filter, batch/datadog]
+          exporters: [datadog]
+        
+        traces/gateway-honeycomb:
+          receivers: [otlp]
+          processors: [filter, batch]
+          exporters: [otlp/honeycombTraces]

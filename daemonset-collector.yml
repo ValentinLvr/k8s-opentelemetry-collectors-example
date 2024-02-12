@@ -1,0 +1,247 @@
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: daemonset-otel-collector
+  namespace: kube-monitoring
+  labels:
+    app.kubernetes.io/instance: daemonset-otel-collector
+    app_kind: "observability"
+    app: "daemonset-otel-collector"
+    criticality: "c2"
+    customer_facing: "false"
+    exposition: "private"
+spec:
+  mode: daemonset
+  serviceAccount: otelcontribcol
+  tolerations:
+  # Allow on high scaling Nodepools
+  - key: node.keplr.io/workload
+    operator: Equal
+    value: stateless
+  # Allow on preemptible Nodepools
+  - key: node.keplr.io/preemtible
+    operator: Equal
+    value: "true"
+  env:
+    - name: DD_SERVICE
+      value: daemonset-otel-collector
+    - name: HONEYCOMB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: honeycomb
+          key: api-key
+    - name: K8S_NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+  resources:
+    requests:
+      memory: 100Mi
+    limits:
+      memory: 1Gi
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+      
+      receiver_creator:
+        watch_observers: [k8s_observer]
+        receivers:
+          kubeletstats:
+            rule: type == "k8s.node"
+            config:
+              collection_interval: 40s
+              auth_type: serviceAccount
+              endpoint: "`endpoint`:`kubelet_endpoint_port`"
+              insecure_skip_verify: true
+              metrics:
+                k8s.node.uptime:
+                  enabled: true
+                k8s.pod.uptime:
+                  enabled: true
+                k8s.pod.cpu_limit_utilization:
+                  enabled: true
+                k8s.pod.cpu_request_utilization:
+                  enabled: true
+                k8s.pod.memory_limit_utilization:
+                  enabled: true
+                k8s.pod.memory_request_utilization:
+                  enabled: true
+                k8s.container.cpu_limit_utilization:
+                  enabled: true
+                k8s.container.cpu_request_utilization:
+                  enabled: true
+                k8s.container.memory_limit_utilization:
+                  enabled: true
+                k8s.container.memory_request_utilization:
+                  enabled: true
+                k8s.volume.inodes.used:
+                  enabled: false
+                k8s.volume.inodes.free:
+                  enabled: false
+                k8s.volume.inodes:
+                  enabled: false
+                k8s.pod.memory.rss:
+                  enabled: false
+                k8s.pod.memory.working_set:
+                  enabled: false
+                k8s.pod.memory.available:
+                  enabled: false
+                k8s.pod.memory.page_faults:
+                  enabled: false
+                k8s.pod.memory.major_page_faults:
+                  enabled: false
+                k8s.pod.filesystem.available:
+                  enabled: false
+                k8s.node.memory.page_faults:
+                  enabled: false
+                k8s.node.memory.major_page_faults:
+                  enabled: false
+                k8s.node.cpu.time:
+                  enabled: false
+                k8s.pod.cpu.time:
+                  enabled: false
+                container.cpu.utilization:
+                  enabled: false
+                container.memory.available:
+                  enabled: false
+                container.memory.usage:
+                  enabled: false
+                container.memory.rss:
+                  enabled: false
+                container.memory.working_set:
+                  enabled: false
+                container.memory.page_faults:
+                  enabled: false
+                container.memory.major_page_faults:
+                  enabled: false
+                container.filesystem.available:
+                  enabled: false
+                container.filesystem.capacity:
+                  enabled: false
+                container.filesystem.usage:
+                  enabled: false
+                container.uptime:
+                  enabled: false
+                container.cpu.time:
+                  enabled: false
+              extra_metadata_labels:
+                - container.id
+              metric_groups:
+                - node
+                - pod
+                - container
+      
+    processors:
+      k8sattributes:
+        passthrough: false
+        auth_type: serviceAccount
+        filter:
+          node_from_env_var: $K8S_NODE_NAME
+        extract:
+          metadata:
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.namespace.name
+            - k8s.node.name
+            - k8s.pod.start_time
+
+      k8sattributes/metrics: #we have to use a specific processor for metrics because kubeletstats receiver does not send pod_IP attr which is the default pod_association attributes used. We then rely on pod.name
+        passthrough: false
+        auth_type: serviceAccount
+        filter:
+          node_from_env_var: $K8S_NODE_NAME
+        pod_association:
+          - sources: # below association matches for pair `k8s.pod.name` and `k8s.namespace.name`. it will look at the corresponding datapoint & try to match it to the pod attributes.
+            - from: resource_attribute
+              name: k8s.pod.name
+            - from: resource_attribute
+              name: k8s.namespace.name
+        extract:
+          metadata:
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.namespace.name
+            - k8s.node.name
+            - k8s.pod.start_time
+
+      resourcedetection:
+        detectors: [env, gcp]
+        timeout: 2s
+        override: true
+      
+      memory_limiter:
+        # drop metrics if memory usage gets too high
+        check_interval: 1s
+        limit_percentage: 70
+        spike_limit_percentage: 30
+      
+      batch:
+        # batch metrics before sending to reduce API usage
+        #send_batch_size: 8192
+        timeout: 5s
+
+      groupbyattrs:
+        keys:
+          - host.id
+          - k8s.node.name
+          - k8s.deployment.name
+          - k8s.pod.name
+          - k8s.pod.uid
+          - container.id
+          - k8s.container.name
+
+      filter/traces:
+        error_mode: ignore
+        traces:
+          span:
+            - 'IsMatch(attributes["http.user_agent"], ".*kube-probe.*")'
+            - 'IsMatch(resource.attributes["http.user_agent"], ".*kube-probe.*")'
+
+    exporters:
+      otlp/k8s-metrics:
+        endpoint: "api.honeycomb.io:443"
+        headers:
+          "x-honeycomb-team": "${env:HONEYCOMB_API_KEY}"
+          "x-honeycomb-dataset": "k8s-metrics"
+
+      otlphttp/gateway-collector:
+        endpoint: http://gateway-otel-collector-collector.kube-monitoring.svc.cluster.local:4318
+    
+    extensions:
+      k8s_observer:
+        auth_type: serviceAccount
+        node: ${K8S_NODE_NAME}
+        observe_pods: true
+        observe_nodes: true
+
+    service:
+      extensions: [k8s_observer]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors:
+            - filter/traces
+            - memory_limiter
+            - k8sattributes
+            - resourcedetection
+            - groupbyattrs
+            - batch
+          exporters: [otlphttp/gateway-collector]
+        metrics:
+          receivers: [receiver_creator]
+          processors:
+            - memory_limiter
+            - k8sattributes/metrics
+            - resourcedetection
+            - groupbyattrs
+            - batch
+          exporters: [otlp/k8s-metrics]
+      telemetry:
+        logs:
+          level: info
+          #development: true
+          encoding: "json"
